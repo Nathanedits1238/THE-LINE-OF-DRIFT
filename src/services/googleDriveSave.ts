@@ -1,3 +1,4 @@
+import { SerializedAchievements } from '../achievements/AchievementSystem';
 import { CharacterProfile, ChallengeItem, TrackConfig, VehicleConfig } from '../types';
 import { getAccessToken } from './firebaseAuth';
 
@@ -11,6 +12,7 @@ export interface GameSaveData {
   vehicles: VehicleConfig[];
   tracks: TrackConfig[];
   challenges: ChallengeItem[];
+  achievementData?: SerializedAchievements;
 }
 
 export interface DriveFileInfo {
@@ -62,7 +64,8 @@ export class GoogleDriveSaveService {
     vehicles: VehicleConfig[],
     tracks: TrackConfig[],
     challenges: ChallengeItem[],
-    googleEmail: string | null = null
+    googleEmail: string | null = null,
+    achievementData?: SerializedAchievements
   ): Promise<{ fileId: string; modifiedTime: string }> {
     const token = await getAccessToken();
     if (!token) {
@@ -71,7 +74,7 @@ export class GoogleDriveSaveService {
 
     const now = new Date();
     const payload: GameSaveData = {
-      version: 1,
+      version: 2,
       savedAt: now.getTime(),
       savedAtFormatted: now.toLocaleString('pt-BR'),
       pilotName: profile.name,
@@ -80,6 +83,7 @@ export class GoogleDriveSaveService {
       vehicles,
       tracks,
       challenges,
+      achievementData,
     };
 
     const jsonString = JSON.stringify(payload, null, 2);

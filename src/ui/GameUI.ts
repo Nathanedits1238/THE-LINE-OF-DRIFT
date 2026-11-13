@@ -1,3 +1,4 @@
+import { AchievementSystem } from '../achievements/AchievementSystem';
 import { sound } from '../audio/SoundEffects';
 import { DEFAULT_CHALLENGES, DEFAULT_TRACKS, DEFAULT_VEHICLES } from '../data/GameData';
 import { DeviceSpecs } from '../graphics/DeviceBenchmark';
@@ -13,12 +14,15 @@ import { GameSaveData, GoogleDriveSaveService } from '../services/googleDriveSav
 import { GlobalRacerEntry, GoogleSheetsRankingService } from '../services/googleSheetsRanking';
 import { STORY_CHAPTERS } from '../story/StoryData';
 import {
+  AchievementCategory,
+  AchievementDefinition,
   CharacterProfile,
   DialogueLine,
   GameDifficulty,
   GameMode,
   GraphicsQuality,
   LeaderboardEntry,
+  OrientationMode,
   PlayerControls,
   StoryChapter,
   TimeOfDay,
@@ -47,6 +51,7 @@ export class GameUI {
   public timeOfDay: TimeOfDay = 'night';
   public gyroActive: boolean = false;
   private gyroPermitted: boolean = false;
+  public orientationMode: OrientationMode = 'auto';
 
   // Google Authentication & Cloud Save State
   public googleUser: AuthUserProfile | null = null;
@@ -60,6 +65,7 @@ export class GameUI {
   public onTrackChanged?: (track: TrackConfig) => void;
   public onPlayCinematicScene?: (type: 'purchase' | 'upgrade' | 'paint' | 'neon', vehicle: VehicleConfig, detailText: string) => void;
   public onDifficultyChanged?: (diff: GameDifficulty) => void;
+  public onOrientationChanged?: (mode: OrientationMode, effectiveIsVertical: boolean) => void;
 
   // Active dialogue
   private activeDialogueLines: DialogueLine[] = [];
@@ -87,6 +93,14 @@ export class GameUI {
   private minimapFrameSkip: number = 0;
   private static readonly STAR_STRINGS = ['☆☆☆☆☆', '★☆☆☆☆', '★★☆☆☆', '★★★☆☆', '★★★★☆', '★★★★★'];
 
+  // Entry screen vs Main menu state
+  private hasEnteredMainMenu: boolean = false;
+
+  // Achievements System & Custom Unlock Toast Queue
+  public achievements: AchievementSystem = new AchievementSystem();
+  private achievementToastQueue: AchievementDefinition[] = [];
+  private isShowingAchievementToast: boolean = false;
+
   constructor(
     public profile: CharacterProfile,
     public mpManager: MultiplayerRoomManager
@@ -96,20 +110,87 @@ export class GameUI {
     this.root.className = 'game-ui-container';
     document.body.appendChild(this.root);
 
+    this.achievements.syncProfileCounts(
+      this.profile.copsDestroyed,
+      this.profile.totalEscapes,
+      DEFAULT_VEHICLES.filter((v) => v.unlocked).length,
+      0
+    );
+    this.achievements.onAchievementUnlocked = (ach) => this.handleAchievementUnlocked(ach);
+
     this.setupKeyboardListeners();
     this.setupGyroscope();
+    window.addEventListener('resize', () => this.applyOrientationClass());
+    window.addEventListener('orientationchange', () => this.applyOrientationClass());
+    this.applyOrientationClass();
 
     this.authUnsubscribe = initAuth((_user, _token) => {
       this.googleUser = getCurrentUserProfile();
       if (this.googleUser?.displayName && this.profile.name === 'Piloto Fugitivo') {
         this.profile.name = this.googleUser.displayName;
       }
-      if (this.currentMode === 'title') {
+      if (this.currentMode === 'title' && this.hasEnteredMainMenu) {
         this.renderTitleScreen();
       }
     });
 
-    this.renderTitleScreen();
+    this.renderEntryScreen();
+  }
+
+  public isEffectiveVertical(): boolean {
+    if (this.orientationMode === 'vertical') return true;
+    if (this.orientationMode === 'horizontal') return false;
+    return window.innerHeight > window.innerWidth;
+  }
+
+  public setOrientationMode(mode: OrientationMode) {
+    this.orientationMode = mode;
+    this.applyOrientationClass();
+
+    // Best-effort native mobile orientation lock when supported
+    try {
+      const scrOrient = screen.orientation as unknown as {
+        lock?: (o: string) => Promise<void>;
+        unlock?: () => void;
+      };
+      if (scrOrient) {
+        if (mode === 'horizontal' && typeof scrOrient.lock === 'function') {
+          void scrOrient.lock('landscape').catch(() => {});
+        } else if (mode === 'vertical' && typeof scrOrient.lock === 'function') {
+          void scrOrient.lock('portrait').catch(() => {});
+        } else if (mode === 'auto' && typeof scrOrient.unlock === 'function') {
+          scrOrient.unlock();
+        }
+      }
+    } catch {
+      // Desktop / iframe environments handle layout cleanly via CSS mode classes
+    }
+  }
+
+  public toggleHorizontalVertical() {
+    const nextMode: OrientationMode = this.isEffectiveVertical() ? 'horizontal' : 'vertical';
+    this.setOrientationMode(nextMode);
+    this.showToast(
+      nextMode === 'vertical' ? '📲 Modo Vertical (Retrato) ativado!' : '↔️ Modo Horizontal (Paisagem) ativado!'
+    );
+  }
+
+  public applyOrientationClass() {
+    const isVert = this.isEffectiveVertical();
+    document.body.classList.toggle('mode-vertical', isVert);
+    document.body.classList.toggle('mode-horizontal', !isVert);
+    document.body.setAttribute('data-orientation-pref', this.orientationMode);
+
+    const hudBtn = document.getElementById('hudOrientationBtn');
+    if (hudBtn) {
+      hudBtn.innerText = isVert ? '📲 VERT' : '↔️ HORIZ';
+    }
+    const menuBtn = document.getElementById('btnToggleOrientation');
+    if (menuBtn) {
+      menuBtn.innerText = isVert ? '📲 Modo: Vertical' : '↔️ Modo: Horizontal';
+    }
+
+    this.onOrientationChanged?.(this.orientationMode, isVert);
   }
 
   // --- Keyboard Handling (WASD / Arrows / Space / Shift) ---
@@ -217,8 +298,98 @@ export class GameUI {
 
   // ================= UI RENDERING =================
 
+  /**
+   * Pre-Main Menu Entry Screen:
+   * Blue background, white title & subtitle, white & black buttons (Começar / Sair)
+   */
+  public renderEntryScreen() {
+    this.currentMode = 'title';
+    this.hasEnteredMainMenu = false;
+    sound.stopAll();
+
+    this.root.innerHTML = `
+      <div class="entry-screen-backdrop">
+        <div class="entry-screen-card">
+          <h1 class="entry-game-title">THE LINE OF DRIFT</h1>
+          <p class="entry-game-subtitle">O melhor jogo de Drift e perseguição que você vai ver!</p>
+          <div class="entry-actions-stack">
+            <button class="entry-bw-btn entry-btn-primary" id="btnEntryStart" type="button">Começar</button>
+            <button class="entry-bw-btn entry-btn-secondary" id="btnEntryExit" type="button">Sair</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('btnEntryStart')?.addEventListener('click', () => {
+      sound.ensureRunning();
+      sound.playCountdownBeep(true);
+      this.hasEnteredMainMenu = true;
+      this.renderTitleScreen();
+    });
+
+    document.getElementById('btnEntryExit')?.addEventListener('click', () => {
+      this.renderExitConfirmScreen();
+    });
+  }
+
+  /**
+   * Exit Confirmation Screen ("Você quer mesmo sair?" with Sair / Ficar)
+   */
+  public renderExitConfirmScreen() {
+    this.currentMode = 'title';
+    this.root.innerHTML = `
+      <div class="entry-screen-backdrop">
+        <div class="entry-screen-card exit-confirm-card">
+          <h1 class="entry-game-title exit-question-title">Você quer mesmo sair?</h1>
+          <p class="entry-game-subtitle">THE LINE OF DRIFT — O melhor jogo de Drift e perseguição que você vai ver!</p>
+          <div class="entry-actions-row">
+            <button class="entry-bw-btn entry-btn-secondary" id="btnConfirmExit" type="button">Sair</button>
+            <button class="entry-bw-btn entry-btn-primary" id="btnConfirmStay" type="button">Ficar</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('btnConfirmExit')?.addEventListener('click', () => {
+      sound.stopAll();
+      try {
+        window.close();
+      } catch {
+        // Browsers often block script-initiated tab closure; show exited state below
+      }
+      this.renderExitedScreen();
+    });
+
+    document.getElementById('btnConfirmStay')?.addEventListener('click', () => {
+      if (this.hasEnteredMainMenu) {
+        this.renderTitleScreen();
+      } else {
+        this.renderEntryScreen();
+      }
+    });
+  }
+
+  private renderExitedScreen() {
+    this.root.innerHTML = `
+      <div class="entry-screen-backdrop">
+        <div class="entry-screen-card">
+          <h1 class="entry-game-title">THE LINE OF DRIFT</h1>
+          <p class="entry-game-subtitle">Jogo encerrado. Obrigado por jogar!</p>
+          <div class="entry-actions-stack">
+            <button class="entry-bw-btn entry-btn-primary" id="btnReturnFromExit" type="button">Voltar ao Início</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('btnReturnFromExit')?.addEventListener('click', () => {
+      this.renderEntryScreen();
+    });
+  }
+
   public renderTitleScreen() {
     this.currentMode = 'title';
+    this.hasEnteredMainMenu = true;
     this.root.innerHTML = `
       <div class="screen-backdrop title-screen">
         <div class="top-auth-bar">
@@ -264,9 +435,9 @@ export class GameUI {
         </div>
 
         <div class="title-header">
-          <div class="badge-tag">3D POLICE PURSUIT RACING</div>
-          <h1 class="game-logo">OUTLAW <span>VELOCITY</span></h1>
-          <p class="tagline">Perseguição Policial · Física Realista · Modo História com Luca & Miguel</p>
+          <div class="badge-tag">3D DRIFT & POLICE PURSUIT</div>
+          <h1 class="game-logo">THE LINE OF <span>DRIFT</span></h1>
+          <p class="tagline">O melhor jogo de Drift e perseguição que você vai ver!</p>
           <div class="device-preset-tag">
             <span>📱 <strong>Gráfico Padrão:</strong> ${this.quality === 'low' ? 'Baixo' : this.quality === 'medium' ? 'Médio' : this.quality === 'high' ? 'Alto' : 'Ultra (Realista)'}</span>
             <span class="preset-tag-desc">(${this.deviceSpecs?.recommendationReason || 'Auto-calibrado para o seu aparelho'})</span>
@@ -325,15 +496,23 @@ export class GameUI {
 
         <div class="bottom-dock-nav">
           <button class="dock-btn" id="btnGarage">🚗 Garagem & Tuning</button>
+          <button class="dock-btn achievements-dock-btn" id="btnAchievements">🎖️ Conquistas (${this.achievements.getUnlockedCount()}/${this.achievements.achievements.length})</button>
           <button class="dock-btn cloud-dock-btn" id="btnDriveCloud">☁️ Salvar no Drive</button>
           <button class="dock-btn ranking-dock-btn" id="btnLiveRanking">🏆 Ranking Global</button>
           <button class="dock-btn" id="btnLeaderboard">🏅 Salas Locais</button>
+          <button class="dock-btn" id="btnToggleOrientation">${this.isEffectiveVertical() ? '📲 Modo: Vertical' : '↔️ Modo: Horizontal'}</button>
           <button class="dock-btn" id="btnSettings">⚙️ Gráficos & Clima</button>
+          <button class="dock-btn" id="btnMainMenuExit">🚪 Sair</button>
         </div>
       </div>
     `;
 
     // Event Bindings
+    document.getElementById('btnAchievements')?.addEventListener('click', () => this.showAchievementsModal());
+    document.getElementById('btnToggleOrientation')?.addEventListener('click', () => {
+      this.toggleHorizontalVertical();
+    });
+    document.getElementById('btnMainMenuExit')?.addEventListener('click', () => this.renderExitConfirmScreen());
     document.getElementById('btnGoogleSignIn')?.addEventListener('click', async () => {
       try {
         const { user } = await googleSignIn();
@@ -784,6 +963,7 @@ export class GameUI {
               upgradeName = `Blindagem Nível ${selectedVehicle.levelArmor}`;
             }
             this.onVehicleChanged?.(selectedVehicle);
+            this.achievements.recordUpgradeInstalled();
             modal.remove();
             this.onPlayCinematicScene?.('upgrade', selectedVehicle, upgradeName);
           } else {
@@ -805,6 +985,7 @@ export class GameUI {
           selectedVehicle.unlocked = true;
           this.profile.selectedCarId = selectedVehicle.id;
           this.onVehicleChanged?.(selectedVehicle);
+          this.achievements.recordCarUnlocked(DEFAULT_VEHICLES.filter((v) => v.unlocked).length);
           modal.remove();
           this.onPlayCinematicScene?.('purchase', selectedVehicle, `Novo Carro Adquirido: ${selectedVehicle.name}`);
         } else {
@@ -1059,7 +1240,8 @@ export class GameUI {
                 DEFAULT_VEHICLES,
                 DEFAULT_TRACKS,
                 DEFAULT_CHALLENGES,
-                this.googleUser?.email || null
+                this.googleUser?.email || null,
+                this.achievements.exportData()
               );
               sound.playSuccessFanfare();
               this.showToast(`✅ Progresso salvo no Google Drive! (ID: ${result.fileId.slice(0, 8)}...)`);
@@ -1076,7 +1258,7 @@ export class GameUI {
       modal.querySelector('#btnLoadFromCloud')?.addEventListener('click', () => {
         this.showConfirmationModal(
           '📥 Carregar do Google Drive',
-          '<strong>Atenção:</strong> Restaurar o save do Google Drive substituirá os dados locais atuais (dinheiro, carros equipados e capítulos) pelo backup da nuvem.<br><br>Deseja continuar?',
+          '<strong>Atenção:</strong> Restaurar o save do Google Drive substituirá os dados locais atuais (dinheiro, carros equipados e conquistas) pelo backup da nuvem.<br><br>Deseja continuar?',
           async () => {
             try {
               const loadBtn = modal.querySelector('#btnLoadFromCloud') as HTMLButtonElement;
@@ -1106,6 +1288,9 @@ export class GameUI {
                   const localC = DEFAULT_CHALLENGES.find((c) => c.id === savedC.id);
                   if (localC) Object.assign(localC, savedC);
                 });
+              }
+              if (data.achievementData) {
+                this.achievements.importData(data.achievementData);
               }
 
               this.onCloudSaveRestored?.(data);
@@ -1319,6 +1504,194 @@ export class GameUI {
     }, 3800);
   }
 
+  // --- Achievement Unlock Handler & Custom Queued Toast ---
+  private handleAchievementUnlocked(ach: AchievementDefinition) {
+    this.profile.cash += ach.rewardCash;
+    this.profile.repPoints += ach.rewardRep;
+    if (this.profile.repPoints >= this.profile.repLevel * 1000) {
+      this.profile.repLevel++;
+    }
+    this.achievementToastQueue.push(ach);
+    if (!this.isShowingAchievementToast) {
+      this.drainAchievementToastQueue();
+    }
+  }
+
+  private drainAchievementToastQueue() {
+    const next = this.achievementToastQueue.shift();
+    if (!next) {
+      this.isShowingAchievementToast = false;
+      return;
+    }
+    this.isShowingAchievementToast = true;
+    sound.playAchievementUnlockSound();
+
+    const tierLabels: Record<AchievementDefinition['tier'], string> = {
+      bronze: 'BRONZE',
+      silver: 'PRATA',
+      gold: 'OURO',
+      platinum: 'PLATINA',
+    };
+
+    const toast = document.createElement('div');
+    toast.className = `achievement-toast-banner tier-${next.tier}`;
+    toast.innerHTML = `
+      <div class="ach-toast-shine"></div>
+      <div class="ach-toast-medal">
+        <span class="ach-toast-icon">${next.icon}</span>
+      </div>
+      <div class="ach-toast-body">
+        <div class="ach-toast-kicker">
+          <span>🏆 CONQUISTA DESBLOQUEADA!</span>
+          <span class="ach-tier-pill tier-${next.tier}">${tierLabels[next.tier]}</span>
+        </div>
+        <div class="ach-toast-title">${next.title}</div>
+        <div class="ach-toast-desc">${next.description}</div>
+        <div class="ach-toast-rewards">
+          <span>💰 +R$ ${next.rewardCash.toLocaleString()}</span>
+          <span>⭐ +${next.rewardRep} RP</span>
+        </div>
+      </div>
+    `;
+    this.root.appendChild(toast);
+
+    setTimeout(() => {
+      toast.classList.add('ach-toast-visible');
+    }, 20);
+
+    setTimeout(() => {
+      toast.classList.remove('ach-toast-visible');
+      setTimeout(() => {
+        toast.remove();
+        this.drainAchievementToastQueue();
+      }, 420);
+    }, 4400);
+  }
+
+  // --- Achievements Modal ---
+  public showAchievementsModal() {
+    const modal = document.createElement('div');
+    modal.className = 'modal-backdrop';
+    let selectedCategory: AchievementCategory | 'all' = 'all';
+
+    const renderContent = () => {
+      const unlockedCount = this.achievements.getUnlockedCount();
+      const totalCount = this.achievements.achievements.length;
+      const stats = this.achievements.stats;
+      const filtered =
+        selectedCategory === 'all'
+          ? this.achievements.achievements
+          : this.achievements.achievements.filter((a) => a.category === selectedCategory);
+
+      const categories: { id: AchievementCategory | 'all'; label: string }[] = [
+        { id: 'all', label: 'Todas' },
+        { id: 'distance', label: '🛣️ Distância' },
+        { id: 'drift', label: '💨 Drift' },
+        { id: 'pursuit', label: '🚔 Perseguição' },
+        { id: 'stunt', label: '🚀 Acrobacias' },
+        { id: 'garage', label: '🔧 Garagem' },
+      ];
+
+      const tierNames: Record<AchievementDefinition['tier'], string> = {
+        bronze: 'Bronze',
+        silver: 'Prata',
+        gold: 'Ouro',
+        platinum: 'Platina',
+      };
+
+      modal.innerHTML = `
+        <div class="modal-card extra-large-modal">
+          <div class="modal-header">
+            <h2>🎖️ CONQUISTAS & MARCOS DO PILOTO (${unlockedCount}/${totalCount})</h2>
+            <button class="close-modal-btn">&times;</button>
+          </div>
+
+          <div class="ach-summary-strip">
+            <div class="ach-stat-box">
+              <span class="ach-stat-val">${stats.totalDistanceKm.toFixed(1)} km</span>
+              <span class="ach-stat-lbl">Rodados</span>
+            </div>
+            <div class="ach-stat-box">
+              <span class="ach-stat-val">${stats.perfectDriftsCount}</span>
+              <span class="ach-stat-lbl">Drifts Perfeitos</span>
+            </div>
+            <div class="ach-stat-box">
+              <span class="ach-stat-val">${stats.maxSpeedKmh} km/h</span>
+              <span class="ach-stat-lbl">Vel. Máxima</span>
+            </div>
+            <div class="ach-stat-box">
+              <span class="ach-stat-val">${stats.copsDestroyed}</span>
+              <span class="ach-stat-lbl">Viaturas Destruídas</span>
+            </div>
+            <div class="ach-stat-box">
+              <span class="ach-stat-val">${stats.totalEscapes}</span>
+              <span class="ach-stat-lbl">Fugas Limpas</span>
+            </div>
+          </div>
+
+          <div class="ach-category-tabs">
+            ${categories
+              .map(
+                (c) => `
+              <button class="option-btn ach-cat-btn ${selectedCategory === c.id ? 'active' : ''}" data-cat="${c.id}">
+                ${c.label}
+              </button>
+            `
+              )
+              .join('')}
+          </div>
+
+          <div class="ach-cards-grid">
+            ${filtered
+              .map((ach) => {
+                const ratio = this.achievements.getProgressRatio(ach);
+                const pct = Math.round(ratio * 100);
+                const curVal = this.achievements.getCurrentStatValue(ach);
+                const unlockedDate = ach.unlockedAt
+                  ? new Date(ach.unlockedAt).toLocaleDateString('pt-BR')
+                  : '';
+                return `
+                  <div class="ach-card ${ach.unlocked ? 'ach-unlocked' : 'ach-locked'} tier-${ach.tier}">
+                    <div class="ach-card-top">
+                      <div class="ach-card-medal">${ach.icon}</div>
+                      <div class="ach-card-head-info">
+                        <div class="ach-card-title-row">
+                          <h3>${ach.title}</h3>
+                          <span class="ach-tier-pill tier-${ach.tier}">${tierNames[ach.tier]}</span>
+                        </div>
+                        <p class="ach-card-desc">${ach.description}</p>
+                      </div>
+                    </div>
+                    <div class="ach-progress-wrap">
+                      <div class="ach-progress-bar">
+                        <div class="ach-progress-fill" style="width: ${pct}%"></div>
+                      </div>
+                      <div class="ach-progress-meta">
+                        <span>${Math.min(curVal, ach.targetValue)} / ${ach.targetValue} ${ach.unit} (${pct}%)</span>
+                        <span class="ach-reward-text">${ach.unlocked ? `✅ Desbloqueada ${unlockedDate}` : `🎁 +R$ ${ach.rewardCash.toLocaleString()} · +${ach.rewardRep} RP`}</span>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              })
+              .join('')}
+          </div>
+        </div>
+      `;
+
+      modal.querySelector('.close-modal-btn')?.addEventListener('click', () => modal.remove());
+      modal.querySelectorAll('.ach-cat-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          selectedCategory = (btn.getAttribute('data-cat') as AchievementCategory | 'all') || 'all';
+          renderContent();
+        });
+      });
+    };
+
+    this.root.appendChild(modal);
+    renderContent();
+  }
+
   // --- Settings Modal (Graphics, Weather, Time of Day, Gyro, Google Account) ---
   private showSettingsModal() {
     const modal = document.createElement('div');
@@ -1489,6 +1862,25 @@ export class GameUI {
           </div>
 
           <div class="setting-group">
+            <label>Orientação / Modo do Jogo (Horizontal ou Vertical):</label>
+            <div class="btn-group">
+              ${[
+                { id: 'auto', label: '🔄 Automático' },
+                { id: 'horizontal', label: '↔️ Modo Horizontal' },
+                { id: 'vertical', label: '📲 Modo Vertical' },
+              ]
+                .map(
+                  (o) => `
+                <button class="setting-choice ${this.orientationMode === o.id ? 'active' : ''}" data-type="orientation" data-val="${o.id}">
+                  ${o.label}
+                </button>
+              `
+                )
+                .join('')}
+            </div>
+          </div>
+
+          <div class="setting-group">
             <label>Modo Giroscópio (Controle por Inclinação):</label>
             <button class="toggle-btn ${this.gyroActive ? 'active' : ''}" id="toggleGyroBtn">
               ${this.gyroActive ? 'GIROSCÓPIO ATIVADO' : 'GIROSCÓPIO DESATIVADO'}
@@ -1541,6 +1933,9 @@ export class GameUI {
         if (type === 'quality') this.quality = val as GraphicsQuality;
         if (type === 'weather') this.weather = val as WeatherType;
         if (type === 'timeOfDay') this.timeOfDay = val as TimeOfDay;
+        if (type === 'orientation') {
+          this.setOrientationMode(val as OrientationMode);
+        }
         if (type === 'difficulty') {
           this.profile.difficulty = val as GameDifficulty;
           this.onDifficultyChanged?.(this.profile.difficulty);
@@ -1678,6 +2073,7 @@ export class GameUI {
           <div class="pursuit-status-badge" id="hudPursuitStatus">PATRULHA DA CIDADE</div>
 
           <div class="top-quick-actions">
+            <button class="hud-icon-btn" id="hudOrientationBtn" title="Alternar Horizontal / Vertical">${this.isEffectiveVertical() ? '📲 VERT' : '↔️ HORIZ'}</button>
             <button class="hud-icon-btn" id="hudGyroToggle" title="Alternar Giroscópio">📱 GIRO: ${this.gyroActive ? 'ON' : 'OFF'}</button>
             <button class="hud-icon-btn" id="hudCamBtn" title="Mudar Câmera">🎥 CÂMERA</button>
             <button class="hud-icon-btn" id="hudAudioBtn" title="Som">🔊</button>
@@ -1779,6 +2175,10 @@ export class GameUI {
       if (btn) btn.innerText = isMuted ? '🔇' : '🔊';
     });
 
+    document.getElementById('hudOrientationBtn')?.addEventListener('click', () => {
+      this.toggleHorizontalVertical();
+    });
+
     document.getElementById('hudGyroToggle')?.addEventListener('click', async () => {
       if (this.gyroActive) {
         this.gyroActive = false;
@@ -1811,6 +2211,14 @@ export class GameUI {
       );
       el.addEventListener(
         'pointerleave',
+        (e) => {
+          e.preventDefault();
+          onUp();
+        },
+        { passive: false }
+      );
+      el.addEventListener(
+        'pointercancel',
         (e) => {
           e.preventDefault();
           onUp();

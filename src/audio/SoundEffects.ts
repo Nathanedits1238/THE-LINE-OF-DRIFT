@@ -30,6 +30,24 @@ export class SoundEngine {
   private sirenGain: GainNode | null = null;
   private sirenPlaying: boolean = false;
 
+  // Dynamic City Ambiance & Environmental Acoustics nodes
+  private cityHumGain: GainNode | null = null;
+  private cityHumFilter: BiquadFilterNode | null = null;
+
+  private windGain: GainNode | null = null;
+  private windFilter: BiquadFilterNode | null = null;
+
+  private tireResonanceGain: GainNode | null = null;
+  private tireResonanceFilter: BiquadFilterNode | null = null;
+
+  private sirenEchoDelay: DelayNode | null = null;
+  private sirenEchoFeedback: GainNode | null = null;
+  private sirenEchoWetGain: GainNode | null = null;
+
+  private tunnelDelay: DelayNode | null = null;
+  private tunnelFeedback: GainNode | null = null;
+  private tunnelWetGain: GainNode | null = null;
+
   // Pre-allocated noise buffer for zero GC audio
   private sharedNoiseBuffer: AudioBuffer | null = null;
 
@@ -62,6 +80,7 @@ export class SoundEngine {
     this.setupDriftSynth();
     this.setupNitroSynth();
     this.setupSirenSynth();
+    this.setupCityAmbianceSynth();
   }
 
   public ensureRunning() {
@@ -194,6 +213,112 @@ export class SoundEngine {
     this.sirenLfo.start();
   }
 
+  // Dynamic City Ambiance Layer: Urban bed, skyscraper siren echoes, bridge wind, tunnel tire resonance
+  private setupCityAmbianceSynth() {
+    if (!this.ctx || !this.masterGain || !this.sharedNoiseBuffer) return;
+    const now = this.ctx.currentTime;
+
+    // 1. Urban Background Hum (low-passed city traffic/atmosphere bed)
+    const cityNoise = this.ctx.createBufferSource();
+    cityNoise.buffer = this.sharedNoiseBuffer;
+    cityNoise.loop = true;
+
+    this.cityHumFilter = this.ctx.createBiquadFilter();
+    this.cityHumFilter.type = 'lowpass';
+    this.cityHumFilter.frequency.setValueAtTime(220, now);
+
+    this.cityHumGain = this.ctx.createGain();
+    this.cityHumGain.gain.setValueAtTime(0, now);
+
+    cityNoise.connect(this.cityHumFilter);
+    this.cityHumFilter.connect(this.cityHumGain);
+    this.cityHumGain.connect(this.masterGain);
+    cityNoise.start();
+
+    // 2. High-Altitude Bridge Wind Layer
+    const windNoise = this.ctx.createBufferSource();
+    windNoise.buffer = this.sharedNoiseBuffer;
+    windNoise.loop = true;
+
+    this.windFilter = this.ctx.createBiquadFilter();
+    this.windFilter.type = 'bandpass';
+    this.windFilter.frequency.setValueAtTime(480, now);
+    this.windFilter.Q.setValueAtTime(1.6, now);
+
+    this.windGain = this.ctx.createGain();
+    this.windGain.gain.setValueAtTime(0, now);
+
+    windNoise.connect(this.windFilter);
+    this.windFilter.connect(this.windGain);
+    this.windGain.connect(this.masterGain);
+    windNoise.start();
+
+    // 3. Tunnel Tire Resonance Layer (hollow acoustic roar of tires on concrete)
+    const tireNoise = this.ctx.createBufferSource();
+    tireNoise.buffer = this.sharedNoiseBuffer;
+    tireNoise.loop = true;
+
+    this.tireResonanceFilter = this.ctx.createBiquadFilter();
+    this.tireResonanceFilter.type = 'bandpass';
+    this.tireResonanceFilter.frequency.setValueAtTime(340, now);
+    this.tireResonanceFilter.Q.setValueAtTime(5.2, now);
+
+    this.tireResonanceGain = this.ctx.createGain();
+    this.tireResonanceGain.gain.setValueAtTime(0, now);
+
+    tireNoise.connect(this.tireResonanceFilter);
+    this.tireResonanceFilter.connect(this.tireResonanceGain);
+    this.tireResonanceGain.connect(this.masterGain);
+    tireNoise.start();
+
+    // 4. Skyscraper Siren Echo Bus (Slapback urban canyon delay on siren)
+    if (this.sirenGain) {
+      this.sirenEchoDelay = this.ctx.createDelay(1.0);
+      this.sirenEchoDelay.delayTime.setValueAtTime(0.21, now);
+
+      const echoFilter = this.ctx.createBiquadFilter();
+      echoFilter.type = 'bandpass';
+      echoFilter.frequency.setValueAtTime(1150, now);
+      echoFilter.Q.setValueAtTime(1.1, now);
+
+      this.sirenEchoFeedback = this.ctx.createGain();
+      this.sirenEchoFeedback.gain.setValueAtTime(0.38, now);
+
+      this.sirenEchoWetGain = this.ctx.createGain();
+      this.sirenEchoWetGain.gain.setValueAtTime(0, now);
+
+      this.sirenGain.connect(this.sirenEchoDelay);
+      this.sirenEchoDelay.connect(echoFilter);
+      echoFilter.connect(this.sirenEchoFeedback);
+      this.sirenEchoFeedback.connect(this.sirenEchoDelay);
+      echoFilter.connect(this.sirenEchoWetGain);
+      this.sirenEchoWetGain.connect(this.masterGain);
+    }
+
+    // 5. Tunnel Slapback Reflection Bus (reflects engine & drift inside tunnels)
+    this.tunnelDelay = this.ctx.createDelay(0.5);
+    this.tunnelDelay.delayTime.setValueAtTime(0.058, now);
+
+    const tunnelBoxFilter = this.ctx.createBiquadFilter();
+    tunnelBoxFilter.type = 'bandpass';
+    tunnelBoxFilter.frequency.setValueAtTime(520, now);
+    tunnelBoxFilter.Q.setValueAtTime(1.4, now);
+
+    this.tunnelFeedback = this.ctx.createGain();
+    this.tunnelFeedback.gain.setValueAtTime(0.45, now);
+
+    this.tunnelWetGain = this.ctx.createGain();
+    this.tunnelWetGain.gain.setValueAtTime(0, now);
+
+    if (this.engineGain) this.engineGain.connect(this.tunnelDelay);
+    if (this.driftNoiseGain) this.driftNoiseGain.connect(this.tunnelDelay);
+    this.tunnelDelay.connect(tunnelBoxFilter);
+    tunnelBoxFilter.connect(this.tunnelFeedback);
+    this.tunnelFeedback.connect(this.tunnelDelay);
+    tunnelBoxFilter.connect(this.tunnelWetGain);
+    this.tunnelWetGain.connect(this.masterGain);
+  }
+
   /**
    * Updates dynamic continuous audio parameters per frame.
    * @param speedKmh Current vehicle speed
@@ -202,6 +327,7 @@ export class SoundEngine {
    * @param nitroActive boolean
    * @param policeHeat 0 to 5
    * @param nearestCopDistance distance in meters to nearest cop
+   * @param acoustics Environmental factors for urban echoes, bridge wind, and tunnel resonance
    */
   public updateContinuousAudio(
     speedKmh: number,
@@ -209,7 +335,13 @@ export class SoundEngine {
     driftSlip: number,
     nitroActive: boolean,
     policeHeat: number,
-    nearestCopDistance: number
+    nearestCopDistance: number,
+    acoustics: {
+      skyscraperDensity: number;
+      bridgeAltitudeFactor: number;
+      tunnelFactor: number;
+      cityDensity: number;
+    } = { skyscraperDensity: 0, bridgeAltitudeFactor: 0, tunnelFactor: 0, cityDensity: 0.4 }
   ) {
     if (!this.ctx || this.muted) return;
     const now = this.ctx.currentTime;
@@ -245,7 +377,7 @@ export class SoundEngine {
       this.nitroNoiseGain.gain.setTargetAtTime(nitroTarget, now, 0.05);
     }
 
-    // 4. Police Siren
+    // 4. Police Siren + Skyscraper Echo Modulation
     if (this.sirenGain && this.sirenLfo) {
       if (policeHeat > 0 && nearestCopDistance < 150) {
         // Distance falloff (closer = louder)
@@ -259,6 +391,41 @@ export class SoundEngine {
       } else {
         this.sirenGain.gain.setTargetAtTime(0, now, 0.2);
       }
+    }
+
+    // 5. Dynamic City Ambiance Layer
+    const speedRatio = Math.min(1, speedKmh / 240);
+
+    // 5a. Urban background hum (muted slightly inside tunnels, stronger in dense city)
+    if (this.cityHumGain && this.cityHumFilter) {
+      const humVol = Math.max(0.015, acoustics.cityDensity * 0.055) * (1 - acoustics.tunnelFactor * 0.4);
+      this.cityHumGain.gain.setTargetAtTime(humVol, now, 0.15);
+      this.cityHumFilter.frequency.setTargetAtTime(180 + acoustics.skyscraperDensity * 140, now, 0.15);
+    }
+
+    // 5b. High-altitude bridge wind rush
+    if (this.windGain && this.windFilter) {
+      const altitudeBoost = acoustics.bridgeAltitudeFactor * 0.22;
+      const openAirSpeedWind = speedRatio * speedRatio * (0.04 + acoustics.bridgeAltitudeFactor * 0.18);
+      const windVol = Math.max(0, (altitudeBoost * 0.45 + openAirSpeedWind) * (1 - acoustics.tunnelFactor * 0.85));
+      this.windGain.gain.setTargetAtTime(windVol, now, 0.12);
+      this.windFilter.frequency.setTargetAtTime(340 + speedRatio * 550 + acoustics.bridgeAltitudeFactor * 260, now, 0.12);
+    }
+
+    // 5c. Tire resonance & acoustic tunnel slapback inside tunnels/underpasses
+    if (this.tireResonanceGain && this.tireResonanceFilter && this.tunnelWetGain) {
+      const tireResVol = acoustics.tunnelFactor * (0.04 + speedRatio * 0.26);
+      this.tireResonanceGain.gain.setTargetAtTime(tireResVol, now, 0.08);
+      this.tireResonanceFilter.frequency.setTargetAtTime(260 + speedRatio * 420, now, 0.08);
+      this.tunnelWetGain.gain.setTargetAtTime(acoustics.tunnelFactor * 0.42, now, 0.08);
+    }
+
+    // 5d. Skyscraper siren echo slapback (stronger around tall buildings or tunnels)
+    if (this.sirenEchoWetGain && this.sirenEchoFeedback && this.sirenEchoDelay) {
+      const echoIntensity = Math.min(1, acoustics.skyscraperDensity * 0.9 + acoustics.tunnelFactor * 0.5);
+      this.sirenEchoWetGain.gain.setTargetAtTime(echoIntensity * 0.58, now, 0.12);
+      this.sirenEchoFeedback.gain.setTargetAtTime(0.25 + echoIntensity * 0.35, now, 0.12);
+      this.sirenEchoDelay.delayTime.setTargetAtTime(0.16 + acoustics.skyscraperDensity * 0.09, now, 0.15);
     }
   }
 
@@ -466,11 +633,61 @@ export class SoundEngine {
     osc2.stop(now + 1.35);
   }
 
+  public playAchievementUnlockSound() {
+    if (!this.ctx || this.muted) return;
+    this.ensureRunning();
+    // Crisp celebratory crystalline arpeggio (D5 -> F#5 -> A5 -> D6 -> A6)
+    const notes = [587.33, 739.99, 880.0, 1174.66, 1760.0];
+    const baseTime = this.ctx.currentTime;
+    notes.forEach((freq, idx) => {
+      const start = baseTime + idx * 0.08;
+      const osc = this.ctx!.createOscillator();
+      osc.type = idx === notes.length - 1 ? 'sine' : 'triangle';
+      osc.frequency.setValueAtTime(freq, start);
+
+      const gain = this.ctx!.createGain();
+      gain.gain.setValueAtTime(0.001, start);
+      gain.gain.linearRampToValueAtTime(idx === notes.length - 1 ? 0.3 : 0.22, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + (idx === notes.length - 1 ? 0.65 : 0.28));
+
+      osc.connect(gain);
+      gain.connect(this.masterGain!);
+      osc.start(start);
+      osc.stop(start + 0.7);
+    });
+  }
+
+  public playNpcBumpSound() {
+    if (!this.ctx || this.muted) return;
+    this.ensureRunning();
+    const now = this.ctx.currentTime;
+
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(160, now);
+    osc.frequency.exponentialRampToValueAtTime(55, now + 0.14);
+
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.28, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
+
+    osc.connect(gain);
+    gain.connect(this.masterGain!);
+    osc.start(now);
+    osc.stop(now + 0.18);
+  }
+
   public stopAll() {
-    if (this.engineGain) this.engineGain.gain.setValueAtTime(0, this.ctx?.currentTime || 0);
-    if (this.sirenGain) this.sirenGain.gain.setValueAtTime(0, this.ctx?.currentTime || 0);
-    if (this.driftNoiseGain) this.driftNoiseGain.gain.setValueAtTime(0, this.ctx?.currentTime || 0);
-    if (this.nitroNoiseGain) this.nitroNoiseGain.gain.setValueAtTime(0, this.ctx?.currentTime || 0);
+    const t = this.ctx?.currentTime || 0;
+    if (this.engineGain) this.engineGain.gain.setValueAtTime(0, t);
+    if (this.sirenGain) this.sirenGain.gain.setValueAtTime(0, t);
+    if (this.driftNoiseGain) this.driftNoiseGain.gain.setValueAtTime(0, t);
+    if (this.nitroNoiseGain) this.nitroNoiseGain.gain.setValueAtTime(0, t);
+    if (this.cityHumGain) this.cityHumGain.gain.setValueAtTime(0, t);
+    if (this.windGain) this.windGain.gain.setValueAtTime(0, t);
+    if (this.tireResonanceGain) this.tireResonanceGain.gain.setValueAtTime(0, t);
+    if (this.sirenEchoWetGain) this.sirenEchoWetGain.gain.setValueAtTime(0, t);
+    if (this.tunnelWetGain) this.tunnelWetGain.gain.setValueAtTime(0, t);
   }
 }
 

@@ -24,6 +24,13 @@ export interface BridgeOverpassDef {
   rampLength: number;
 }
 
+export interface EnvironmentAcoustics {
+  skyscraperDensity: number;
+  bridgeAltitudeFactor: number;
+  tunnelFactor: number;
+  cityDensity: number;
+}
+
 export class CityGenerator {
   public scene: THREE.Scene;
   public culling: CullingManager;
@@ -34,6 +41,10 @@ export class CityGenerator {
   public waypoints: TrackWaypoint[] = [];
   public jumpRamps: JumpRampDef[] = [];
   public bridges: BridgeOverpassDef[] = [];
+  public tunnels: { minX: number; maxX: number; minZ: number; maxZ: number; maxY: number }[] = [];
+  private skyscraperZones: { x: number; z: number; halfW: number; halfL: number; height: number }[] = [];
+  private activeTrackId: string = 'track_city';
+  public roadHalfWidth: number = 11;
 
   // Weather & Environment Elements
   private rainMesh: THREE.Points | null = null;
@@ -50,6 +61,12 @@ export class CityGenerator {
   private static readonly _tempQuat = new THREE.Quaternion();
   private static readonly _tempScale = new THREE.Vector3();
   private static readonly _tempColor = new THREE.Color();
+  private static readonly _acousticsResult: EnvironmentAcoustics = {
+    skyscraperDensity: 0,
+    bridgeAltitudeFactor: 0,
+    tunnelFactor: 0,
+    cityDensity: 0.5,
+  };
 
   constructor(scene: THREE.Scene, culling: CullingManager) {
     this.scene = scene;
@@ -62,6 +79,7 @@ export class CityGenerator {
   public generateTrack(track: TrackConfig, quality: GraphicsQuality) {
     // Clear existing
     this.clear();
+    this.activeTrackId = track.id;
 
     if (track.id === 'track_city') {
       this.buildNeonCity();
@@ -101,6 +119,8 @@ export class CityGenerator {
     this.streetLights = [];
     this.jumpRamps = [];
     this.bridges = [];
+    this.tunnels = [];
+    this.skyscraperZones = [];
     this.culling.clear();
   }
 
@@ -147,8 +167,22 @@ export class CityGenerator {
       this.waypoints.push({ position: p.clone(), heading: angle });
     }
 
-    // Build Road Ribbon along the curve
+    // Concrete Sidewalk Border (Calçadas ao longo da avenida)
     const roadWidth = 22;
+    this.roadHalfWidth = roadWidth / 2;
+    const sidewalkGeo = new THREE.TubeGeometry(curve, 180, roadWidth / 2 + 4.8, 8, true);
+    sidewalkGeo.scale(1, 0.008, 1);
+    const sidewalkMat = new THREE.MeshStandardMaterial({
+      color: 0x2b313d,
+      roughness: 0.9,
+      metalness: 0.05,
+    });
+    const sidewalkMesh = new THREE.Mesh(sidewalkGeo, sidewalkMat);
+    sidewalkMesh.position.y = 0.0;
+    sidewalkMesh.receiveShadow = true;
+    this.trackGroup.add(sidewalkMesh);
+
+    // Build Road Ribbon along the curve
     const roadGeo = new THREE.TubeGeometry(curve, 180, roadWidth / 2, 8, true);
     roadGeo.scale(1, 0.02, 1);
     const roadMesh = new THREE.Mesh(roadGeo, this.roadMaterial);
@@ -445,6 +479,14 @@ export class CityGenerator {
           sign: signDef,
         });
 
+        this.skyscraperZones.push({
+          x,
+          z,
+          halfW: bWidth / 2,
+          halfL: bLength / 2,
+          height: bHeight,
+        });
+
         // Fast Box Collider
         this.colliders.push({
           minX: x - bWidth / 2 - 1.2,
@@ -574,6 +616,66 @@ export class CityGenerator {
       this.buildingsGroup.add(signInstanced);
     }
 
+    // ================= 4.5 TÚNEL METRÓPOLE NEON (TIRE RESONANCE & REVERB ZONE) =================
+    const tunnelStartX = 45;
+    const tunnelEndX = 145;
+    const tunnelLen = tunnelEndX - tunnelStartX;
+    const tunnelCenterX = (tunnelStartX + tunnelEndX) / 2;
+    const tunnelCenterZ = -280;
+    const tunnelWidth = 26;
+    const tunnelHeight = 8.5;
+
+    this.tunnels.push({
+      minX: tunnelStartX,
+      maxX: tunnelEndX,
+      minZ: tunnelCenterZ - tunnelWidth / 2,
+      maxZ: tunnelCenterZ + tunnelWidth / 2,
+      maxY: tunnelHeight,
+    });
+
+    const tunnelConcreteMat = new THREE.MeshStandardMaterial({
+      color: 0x161a22,
+      roughness: 0.85,
+      metalness: 0.2,
+    });
+    // Left & Right concrete tunnel walls
+    const tWallGeo = new THREE.BoxGeometry(tunnelLen, tunnelHeight, 1.8);
+    const tWallN = new THREE.Mesh(tWallGeo, tunnelConcreteMat);
+    tWallN.position.set(tunnelCenterX, tunnelHeight / 2, tunnelCenterZ - tunnelWidth / 2 - 0.9);
+    const tWallS = new THREE.Mesh(tWallGeo, tunnelConcreteMat);
+    tWallS.position.set(tunnelCenterX, tunnelHeight / 2, tunnelCenterZ + tunnelWidth / 2 + 0.9);
+
+    // Tunnel roof slab
+    const tRoofGeo = new THREE.BoxGeometry(tunnelLen, 1.4, tunnelWidth + 3.6);
+    const tRoof = new THREE.Mesh(tRoofGeo, tunnelConcreteMat);
+    tRoof.position.set(tunnelCenterX, tunnelHeight + 0.7, tunnelCenterZ);
+
+    // Glowing overhead LED light strips inside tunnel
+    const ledStripGeo = new THREE.BoxGeometry(tunnelLen - 4, 0.25, 0.6);
+    const ledStripMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff });
+    const ledL = new THREE.Mesh(ledStripGeo, ledStripMat);
+    ledL.position.set(tunnelCenterX, tunnelHeight - 0.15, tunnelCenterZ - 5.5);
+    const ledR = new THREE.Mesh(ledStripGeo, ledStripMat);
+    ledR.position.set(tunnelCenterX, tunnelHeight - 0.15, tunnelCenterZ + 5.5);
+
+    this.trackGroup.add(tWallN, tWallS, tRoof, ledL, ledR);
+
+    // Colliders for tunnel outer walls
+    this.colliders.push(
+      {
+        minX: tunnelStartX,
+        maxX: tunnelEndX,
+        minZ: tunnelCenterZ - tunnelWidth / 2 - 2.0,
+        maxZ: tunnelCenterZ - tunnelWidth / 2,
+      },
+      {
+        minX: tunnelStartX,
+        maxX: tunnelEndX,
+        minZ: tunnelCenterZ + tunnelWidth / 2,
+        maxZ: tunnelCenterZ + tunnelWidth / 2 + 2.0,
+      }
+    );
+
     // ================= 5. POSTES DE LUZ ORGANIZADOS (STRICT SIDEWALK PLACEMENT) =================
     // Placed strictly on sidewalk (14m from centerline) with safety clearance from all track curves
     const lampPositions: { x: number; z: number }[] = [];
@@ -583,6 +685,15 @@ export class CityGenerator {
       const normalZ = -Math.sin(wp.heading);
       const candidateX = wp.position.x + normalX * (roadWidth / 2 + 3.0);
       const candidateZ = wp.position.z + normalZ * (roadWidth / 2 + 3.0);
+
+      // Skip poles inside tunnel corridor
+      if (
+        candidateX >= tunnelStartX - 6 &&
+        candidateX <= tunnelEndX + 6 &&
+        Math.abs(candidateZ - tunnelCenterZ) < tunnelWidth / 2 + 6
+      ) {
+        continue;
+      }
 
       // Verify clearance from all other waypoints to avoid encroachment in curves
       let safeLamp = true;
@@ -683,6 +794,7 @@ export class CityGenerator {
       this.waypoints.push({ position: p.clone(), heading: angle });
     }
 
+    this.roadHalfWidth = 10;
     const roadGeo = new THREE.TubeGeometry(curve, 160, 10, 8, true);
     roadGeo.scale(1, 0.02, 1);
     const road = new THREE.Mesh(roadGeo, this.roadMaterial);
@@ -763,6 +875,7 @@ export class CityGenerator {
       this.waypoints.push({ position: p.clone(), heading: angle });
     }
 
+    this.roadHalfWidth = 9.5;
     const roadGeo = new THREE.TubeGeometry(curve, 160, 9.5, 8, true);
     roadGeo.scale(1, 0.02, 1);
     const road = new THREE.Mesh(roadGeo, this.roadMaterial);
@@ -796,6 +909,14 @@ export class CityGenerator {
       if (Math.random() > 0.4) {
         containerItems.push({ x: cx, y: 9, z: cz, color: cColor });
       }
+
+      this.skyscraperZones.push({
+        x: cx,
+        z: cz,
+        halfW: 3,
+        halfL: 7.5,
+        height: 18,
+      });
 
       this.colliders.push({
         minX: cx - 4,
@@ -864,6 +985,7 @@ export class CityGenerator {
       this.waypoints.push({ position: p.clone(), heading: angle });
     }
 
+    this.roadHalfWidth = 12;
     const roadGeo = new THREE.TubeGeometry(curve, 160, 12, 8, true);
     roadGeo.scale(1, 0.02, 1);
     const road = new THREE.Mesh(roadGeo, this.roadMaterial);
@@ -890,6 +1012,14 @@ export class CityGenerator {
       CityGenerator._tempMatrix.compose(CityGenerator._tempPos, CityGenerator._tempQuat, CityGenerator._tempScale);
 
       canyonInstanced.setMatrixAt(i, CityGenerator._tempMatrix);
+
+      this.skyscraperZones.push({
+        x: rx,
+        z: rz,
+        halfW: 20,
+        halfL: 20,
+        height: 45,
+      });
 
       this.colliders.push({
         minX: rx - 24,
@@ -1244,5 +1374,90 @@ export class CityGenerator {
 
     return minSqDist <= roadTolerance * roadTolerance;
   }
+
+  /**
+   * Computes real-time environmental acoustic factors for the dynamic city ambiance audio layer:
+   * - skyscraperDensity: boosts siren echoes near tall buildings or canyon walls
+   * - bridgeAltitudeFactor: boosts wind rush on elevated highways / high-altitude bridges
+   * - tunnelFactor: boosts tire resonance & acoustic reflections inside tunnels and bridge underpasses
+   * - cityDensity: baseline urban background hum
+   */
+  public getEnvironmentAcoustics(pos: THREE.Vector3): EnvironmentAcoustics {
+    const res = CityGenerator._acousticsResult;
+
+    // 1. Track-level city density
+    res.cityDensity =
+      this.activeTrackId === 'track_city'
+        ? 0.88
+        : this.activeTrackId === 'track_docks'
+          ? 0.55
+          : this.activeTrackId === 'track_coast'
+            ? 0.25
+            : 0.15;
+
+    // 2. Skyscraper proximity & height weighting (drives siren echoes)
+    let skyscraperScore = 0;
+    const maxRadius = 52;
+    for (let i = 0; i < this.skyscraperZones.length; i++) {
+      const b = this.skyscraperZones[i];
+      const clX = Math.max(b.x - b.halfW, Math.min(pos.x, b.x + b.halfW));
+      const clZ = Math.max(b.z - b.halfL, Math.min(pos.z, b.z + b.halfL));
+      const dist = Math.hypot(pos.x - clX, pos.z - clZ);
+      if (dist < maxRadius) {
+        const proximity = 1 - dist / maxRadius;
+        const heightWeight = Math.min(1.4, b.height / 85);
+        skyscraperScore += proximity * heightWeight * 0.45;
+        if (skyscraperScore >= 1.0) {
+          skyscraperScore = 1.0;
+          break;
+        }
+      }
+    }
+    res.skyscraperDensity = Math.min(1.0, skyscraperScore);
+
+    // 3. High-altitude bridge wind factor
+    let altitudeFactor = Math.max(0, Math.min(1.0, pos.y / 9.5));
+    if (this.activeTrackId === 'track_coast') {
+      // Coastal sea breeze adds mild open-air wind factor
+      altitudeFactor = Math.max(altitudeFactor, 0.35);
+    }
+    res.bridgeAltitudeFactor = altitudeFactor;
+
+    // 4. Tunnel & underpass resonance factor
+    let tunnelFactor = 0;
+    for (let i = 0; i < this.tunnels.length; i++) {
+      const t = this.tunnels[i];
+      if (
+        pos.x >= t.minX - 6 &&
+        pos.x <= t.maxX + 6 &&
+        pos.z >= t.minZ &&
+        pos.z <= t.maxZ &&
+        pos.y < t.maxY
+      ) {
+        // Smooth 6m crossfade at tunnel portals
+        const fadeIn = Math.min(1, Math.max(0, (pos.x - (t.minX - 6)) / 6));
+        const fadeOut = Math.min(1, Math.max(0, (t.maxX + 6 - pos.x) / 6));
+        tunnelFactor = Math.max(tunnelFactor, Math.min(fadeIn, fadeOut));
+      }
+    }
+    // Check driving underneath elevated viaducts
+    if (tunnelFactor < 0.8) {
+      for (let i = 0; i < this.bridges.length; i++) {
+        const b = this.bridges[i];
+        if (
+          Math.abs(pos.x - b.centerX) <= b.deckWidth * 0.65 &&
+          pos.z >= b.startZ &&
+          pos.z <= b.endZ &&
+          pos.y < b.deckHeight - 2.0
+        ) {
+          tunnelFactor = Math.max(tunnelFactor, 0.72);
+        }
+      }
+    }
+    res.tunnelFactor = tunnelFactor;
+
+    return res;
+  }
 }
+
 

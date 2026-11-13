@@ -18,6 +18,7 @@ export interface CopUnit {
   updateLights?: (time: number) => void;
   targetOffset: THREE.Vector2; // Tactical offset (flanking left, right, or ramming behind)
   applyDamageDeformation?: (damageRatio: number) => void;
+  applyImpactDeformation?: (localHitDir: THREE.Vector3, impactSpeedMs: number) => void;
   isRoadblock?: boolean;
 }
 
@@ -292,6 +293,7 @@ export class PolicePursuitSystem {
       updateLights: meshData.updatePoliceLights,
       targetOffset: offset,
       applyDamageDeformation: meshData.applyDamageDeformation,
+      applyImpactDeformation: meshData.applyImpactDeformation,
     };
 
     this.cops.push(cop);
@@ -564,12 +566,20 @@ export class PolicePursuitSystem {
   /**
    * Applies damage to a cop when player rams into them.
    */
-  public damageCop(copIndex: number, amount: number): boolean {
+  public damageCop(
+    copIndex: number,
+    amount: number,
+    localHitDir?: THREE.Vector3,
+    impactSpeedMs?: number
+  ): boolean {
     const cop = this.cops[copIndex];
     if (!cop || cop.destroyed) return false;
 
     cop.health = Math.max(0, cop.health - amount);
     const damageRatio = Math.max(0, Math.min(1.0, 1.0 - cop.health / cop.maxHealth));
+    if (localHitDir && impactSpeedMs !== undefined && cop.applyImpactDeformation) {
+      cop.applyImpactDeformation(localHitDir, impactSpeedMs);
+    }
     cop.applyDamageDeformation?.(damageRatio);
 
     if (cop.health <= 0) {

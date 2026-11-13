@@ -3,6 +3,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import * as xb from 'xrblocks';
 import { sound } from './audio/SoundEffects';
 import { CityGenerator } from './city/CityGenerator';
+import { CityNPCSystem } from './city/CityNPCs';
 import { DEFAULT_CHALLENGES, DEFAULT_PROFILE, DEFAULT_TRACKS, DEFAULT_VEHICLES } from './data/GameData';
 import { CullingManager } from './graphics/CullingManager';
 import { DeviceBenchmark, DeviceSpecs } from './graphics/DeviceBenchmark';
@@ -22,6 +23,7 @@ export class OutlawGameScene extends xb.Script {
   // Subsystems & Optimization
   public culling: CullingManager = new CullingManager();
   public city!: CityGenerator;
+  public npcs!: CityNPCSystem;
   public police!: PolicePursuitSystem;
   public mpManager: MultiplayerRoomManager = new MultiplayerRoomManager();
   public ui!: GameUI;
@@ -33,8 +35,24 @@ export class OutlawGameScene extends xb.Script {
   public playerWheels: THREE.Group[] = [];
   public playerNeon: THREE.Mesh | null = null;
   public playerDamageDeform?: (damageRatio: number) => void;
+  public playerImpactDeform?: (localHitDir: THREE.Vector3, impactSpeedMs: number) => void;
+  public playerUpdateDamageEffects?: (
+    dt: number,
+    speedKmh: number,
+    missingWheels?: [boolean, boolean, boolean, boolean]
+  ) => void;
+  public playerResetDeform?: () => void;
   public activeVehicleConfig: VehicleConfig = DEFAULT_VEHICLES[0];
   public activeTrackConfig: TrackConfig = DEFAULT_TRACKS[0];
+
+  // Detached Loose Wheels Visuals
+  private detachedWheels: Array<{
+    mesh: THREE.Group;
+    vel: THREE.Vector3;
+    rotVel: THREE.Vector3;
+    life: number;
+  }> = [];
+  private wheelLossCooldown: number = 0;
 
   // Game Profile & State
   public profile: CharacterProfile = { ...DEFAULT_PROFILE };
@@ -53,10 +71,20 @@ export class OutlawGameScene extends xb.Script {
   // Time & Loop
   private clock: THREE.Clock = new THREE.Clock();
   private orbitAngle: number = 0;
+  private isVerticalMode: boolean = false;
+
+  // Achievement Tracking State (Zero-GC)
+  private lastPlayerPos: THREE.Vector3 = new THREE.Vector3();
+  private activeDriftTime: number = 0;
+  private activeDriftPoints: number = 0;
+  private activeDriftDamaged: boolean = false;
 
   // Zero-GC Preallocated Math Helpers
   private static readonly _relVel = new THREE.Vector3();
   private static readonly _hitNormal = new THREE.Vector3();
+  private static readonly _localHitDir = new THREE.Vector3();
+  private static readonly _copLocalHitDir = new THREE.Vector3();
+  private static readonly _wheelWorldPos = new THREE.Vector3();
   private static readonly _targetCamPos = new THREE.Vector3();
   private static readonly _targetLook = new THREE.Vector3();
 
@@ -98,22 +126,43 @@ export class OutlawGameScene extends xb.Script {
 
     // 2. Initialize City Generator with Occlusion & Frustum Culling
     this.city = new CityGenerator(this.scene, this.culling);
+    this.npcs = new CityNPCSystem(this.scene);
     this.police = new PolicePursuitSystem(this.scene);
     this.police.setDifficulty(this.profile.difficulty || 'very_easy');
 
     // Initial Track & Atmosphere Setup
     this.city.generateTrack(this.activeTrackConfig, initialQuality);
     this.city.applyAtmosphere('night', 'rain', initialQuality);
+    this.repopulateNPCs(this.activeTrackConfig.id);
 
     // Spawn Player Vehicle
     this.setupPlayerVehicle(this.activeVehicleConfig);
+    this.lastPlayerPos.copy(this.playerPhysics.position);
 
     // Initialize UI with Device Specs
     this.ui = new GameUI(this.profile, this.mpManager);
     this.ui.deviceSpecs = this.deviceSpecs;
     this.ui.quality = initialQuality;
-    this.ui.renderTitleScreen();
+    this.isVerticalMode = this.ui.isEffectiveVertical();
+    this.ui.renderEntryScreen();
     this.bindUICallbacks();
+  }
+
+  private repopulateNPCs(trackId: string) {
+    this.npcs.populateForTrack(
+      trackId,
+      this.city.waypoints,
+      this.city.roadHalfWidth,
+      this.city.colliders,
+      this.city.bridges,
+      this.city.tunnels
+    );
+  }
+
+  private resetDriftSession() {
+    this.activeDriftTime = 0;
+    this.activeDriftPoints = 0;
+    this.activeDriftDamaged = false;
   }
 
   private setupPlayerVehicle(config: VehicleConfig) {
@@ -127,6 +176,9 @@ export class OutlawGameScene extends xb.Script {
     this.playerWheels = meshData.wheels;
     this.playerNeon = meshData.neonMesh;
     this.playerDamageDeform = meshData.applyDamageDeformation;
+    this.playerImpactDeform = meshData.applyImpactDeformation;
+    this.playerUpdateDamageEffects = meshData.updateDamageEffects;
+    this.playerResetDeform = meshData.resetDeformation;
     this.scene.add(this.playerVehicleMeshGroup);
 
     const startPos = this.city.waypoints[0]?.position.clone() || new THREE.Vector3(0, 0, 0);
@@ -162,11 +214,16 @@ export class OutlawGameScene extends xb.Script {
       this.activeTrackConfig = track;
       this.city.generateTrack(track, this.ui.quality);
       this.city.applyAtmosphere(this.ui.timeOfDay, this.ui.weather, this.ui.quality);
+      this.repopulateNPCs(track.id);
 
       // Reset Player
       const startWp = this.city.waypoints[0] || { position: new THREE.Vector3(0, 0, 0), heading: 0 };
       this.playerPhysics.reset(startWp.position, startWp.heading);
-      this.playerDamageDeform?.(0);
+      this.lastPlayerPos.copy(startWp.position);
+      this.resetDriftSession();
+      this.playerResetDeform?.();
+      this.clearDetachedWheels();
+      this.wheelLossCooldown = 0;
 
       // Mode-specific police configuration
       if (mode === 'story' && chapter) {
@@ -209,12 +266,19 @@ export class OutlawGameScene extends xb.Script {
       this.activeTrackConfig = track;
       this.city.generateTrack(track, this.ui.quality);
       this.city.applyAtmosphere(this.ui.timeOfDay, this.ui.weather, this.ui.quality);
+      this.repopulateNPCs(track.id);
     };
 
     // Cloud Save Restored (Google Drive)
     this.ui.onCloudSaveRestored = (saveData) => {
       this.profile = saveData.profile;
       this.police.setDifficulty(this.profile.difficulty || 'very_easy');
+      this.ui.achievements.syncProfileCounts(
+        this.profile.copsDestroyed,
+        this.profile.totalEscapes,
+        DEFAULT_VEHICLES.filter((v) => v.unlocked).length,
+        0
+      );
       const equippedCar = DEFAULT_VEHICLES.find((v) => v.id === this.profile.selectedCarId) || DEFAULT_VEHICLES[0];
       this.setupPlayerVehicle(equippedCar);
     };
@@ -228,6 +292,11 @@ export class OutlawGameScene extends xb.Script {
     // 3D Cinematic Animation on Purchase / Modifying Car
     this.ui.onPlayCinematicScene = (type, vehicle, detailText) => {
       this.playCinematicAnimation(type, vehicle, detailText);
+    };
+
+    // Horizontal / Vertical Game Mode Changed
+    this.ui.onOrientationChanged = (_mode, isVertical) => {
+      this.isVerticalMode = isVertical;
     };
   }
 
@@ -395,8 +464,15 @@ export class OutlawGameScene extends xb.Script {
         Math.cos(this.orbitAngle) * radius
       );
       this.camera.lookAt(0, 1.2, 0);
+      this.npcs.update(dt, this.camera.position, 0, this.city.waypoints, this.city.roadHalfWidth);
       return;
     }
+
+    // Update wheel loss cooldown & loose tumbling detached wheels
+    if (this.wheelLossCooldown > 0) {
+      this.wheelLossCooldown = Math.max(0, this.wheelLossCooldown - dt);
+    }
+    this.updateDetachedWheels(dt);
 
     // Camera Switch Request
     if (this.ui.controls.switchCamera) {
@@ -409,7 +485,11 @@ export class OutlawGameScene extends xb.Script {
       this.ui.controls.resetVehicle = false;
       const nearestWp = this.findNearestWaypoint(this.playerPhysics.position);
       this.playerPhysics.reset(nearestWp.position, nearestWp.heading);
-      this.playerDamageDeform?.(0);
+      this.lastPlayerPos.copy(nearestWp.position);
+      this.resetDriftSession();
+      this.playerResetDeform?.();
+      this.clearDetachedWheels();
+      this.wheelLossCooldown = 0;
     }
 
     // 1. Check road elevation (bridges/overpass) & stunt jump ramps
@@ -422,10 +502,19 @@ export class OutlawGameScene extends xb.Script {
       this.ui.showToast('🚀 SALTO ESPORTIVO! +350 PTS');
       this.profile.cash += 350;
       this.playerPhysics.driftScore += 350;
+      this.ui.achievements.recordStuntJump();
     }
 
     const targetHeight = rampCheck.hit ? rampCheck.height : groundHeight;
-    this.playerPhysics.update(dt, this.ui.controls, targetHeight);
+    const physicsStep = this.playerPhysics.update(dt, this.ui.controls, targetHeight);
+
+    // Record distance & top speed milestones
+    const frameDist = this.lastPlayerPos.distanceTo(this.playerPhysics.position);
+    if (frameDist > 0.001 && frameDist < 30) {
+      this.ui.achievements.recordDistance(frameDist);
+    }
+    this.lastPlayerPos.copy(this.playerPhysics.position);
+    this.ui.achievements.recordSpeed(this.playerPhysics.speedKmh);
 
     // Off-road Penalty: 20 pts/s on 'very_easy', scaling up to 70 pts/s on 'professional'
     const isOnRoad = this.city.isPositionOnRoadway(this.playerPhysics.position);
@@ -469,9 +558,20 @@ export class OutlawGameScene extends xb.Script {
     const collisionNormal = this.city.checkBuildingCollision(this.playerPhysics.position);
     if (collisionNormal) {
       const impactSpeed = this.playerPhysics.velocity.length();
-      if (impactSpeed > 3.0) {
+      if (impactSpeed > 2.5) {
+        if (this.playerPhysics.isDrifting) this.activeDriftDamaged = true;
         sound.playCollisionSound(Math.min(1.0, impactSpeed / 30));
         this.playerPhysics.applyCollisionImpulse(collisionNormal, impactSpeed);
+
+        // Speed-scaled directional impact deformation (hit side is opposite push-out normal)
+        OutlawGameScene._hitNormal.copy(collisionNormal).negate();
+        this.worldDirToLocal(
+          OutlawGameScene._hitNormal,
+          this.playerPhysics.heading,
+          OutlawGameScene._localHitDir
+        );
+        this.playerImpactDeform?.(OutlawGameScene._localHitDir, impactSpeed);
+        this.maybeDetachWheel(OutlawGameScene._localHitDir, impactSpeed);
 
         // Infraction in Free Roam -> Triggers police attention!
         if (this.currentMode === 'free_roam' && this.police.heatLevel === 0) {
@@ -505,16 +605,40 @@ export class OutlawGameScene extends xb.Script {
         // Impact collision without allocations!
         OutlawGameScene._relVel.subVectors(this.playerPhysics.velocity, cop.velocity);
         const impactSpeed = OutlawGameScene._relVel.length();
-        if (impactSpeed > 4.0) {
+        if (impactSpeed > 3.0) {
+          if (this.playerPhysics.isDrifting) this.activeDriftDamaged = true;
           sound.playCollisionSound(Math.min(1.0, impactSpeed / 25));
           OutlawGameScene._hitNormal.subVectors(this.playerPhysics.position, cop.position).normalize();
           this.playerPhysics.applyCollisionImpulse(OutlawGameScene._hitNormal, impactSpeed * 0.4);
 
+          // Cop local hit direction (toward player)
+          this.worldDirToLocal(
+            OutlawGameScene._hitNormal,
+            cop.heading,
+            OutlawGameScene._copLocalHitDir
+          );
+
+          // Player local hit direction (toward cop = -_hitNormal)
+          OutlawGameScene._hitNormal.negate();
+          this.worldDirToLocal(
+            OutlawGameScene._hitNormal,
+            this.playerPhysics.heading,
+            OutlawGameScene._localHitDir
+          );
+          this.playerImpactDeform?.(OutlawGameScene._localHitDir, impactSpeed);
+          this.maybeDetachWheel(OutlawGameScene._localHitDir, impactSpeed);
+
           // Damage Cop!
-          const destroyed = this.police.damageCop(idx, impactSpeed * 3.5);
+          const destroyed = this.police.damageCop(
+            idx,
+            impactSpeed * 3.5,
+            OutlawGameScene._copLocalHitDir,
+            impactSpeed
+          );
           if (destroyed) {
             this.profile.copsDestroyed++;
             this.profile.cash += 2500;
+            this.ui.achievements.recordCopDestroyed();
           }
         }
       }
@@ -523,19 +647,32 @@ export class OutlawGameScene extends xb.Script {
     // Check collisions with Police Roadblocks (Barricades & Spike Strips)
     const rbCollision = this.police.checkRoadblockCollision(this.playerPhysics.position, 1.8);
     if (rbCollision && rbCollision.hit) {
+      if (this.playerPhysics.isDrifting) this.activeDriftDamaged = true;
+      OutlawGameScene._hitNormal.copy(rbCollision.normal).negate();
+      this.worldDirToLocal(
+        OutlawGameScene._hitNormal,
+        this.playerPhysics.heading,
+        OutlawGameScene._localHitDir
+      );
+
       if (rbCollision.spikeHit) {
         this.playerPhysics.health = Math.max(0, this.playerPhysics.health - 25);
         this.playerPhysics.velocity.multiplyScalar(0.5);
         this.playerPhysics.speedKmh *= 0.5;
         sound.playCollisionSound(0.85);
         this.ui.showToast('💥 FITA DE PREGOS (SPIKE STRIP)! PNEUS FURADOS (-25% SAÚDE)');
+        this.maybeDetachWheel(OutlawGameScene._localHitDir, 24, true);
         this.police.smashRoadblock(rbCollision.roadblockIndex);
       } else {
-        const impactSpeed = this.playerPhysics.speedKmh;
-        if (impactSpeed > 75) {
+        const impactSpeedKmh = this.playerPhysics.speedKmh;
+        const impactSpeedMs = impactSpeedKmh / 3.6;
+        this.playerImpactDeform?.(OutlawGameScene._localHitDir, impactSpeedMs);
+        this.maybeDetachWheel(OutlawGameScene._localHitDir, impactSpeedMs);
+
+        if (impactSpeedKmh > 75) {
           // High-speed breach! Smash through the cruisers
           this.police.smashRoadblock(rbCollision.roadblockIndex);
-          this.playerPhysics.applyCollisionImpulse(rbCollision.normal, impactSpeed * 0.25);
+          this.playerPhysics.applyCollisionImpulse(rbCollision.normal, impactSpeedKmh * 0.25);
           this.playerPhysics.health = Math.max(0, this.playerPhysics.health - 12);
           this.profile.cash += 1500;
           this.playerPhysics.driftScore += 1000;
@@ -543,11 +680,40 @@ export class OutlawGameScene extends xb.Script {
           this.ui.showToast('💥 BARREIRA POLICIAL DESTRUÍDA! +R$ 1.500 (+1000 PTS)');
         } else {
           // Too slow to smash through: bounced back
-          this.playerPhysics.applyCollisionImpulse(rbCollision.normal, Math.max(12, impactSpeed * 0.45));
+          this.playerPhysics.applyCollisionImpulse(rbCollision.normal, Math.max(12, impactSpeedKmh * 0.45));
           this.playerPhysics.health = Math.max(0, this.playerPhysics.health - 15);
           sound.playCollisionSound(0.9);
           this.ui.showToast('⚠️ BLOQUEIO POLICIAL! IMPACTO FORTE');
         }
+      }
+    }
+
+    // Track clean/perfect drifts (sustained drift without collisions)
+    if (this.playerPhysics.isDrifting && this.playerPhysics.speedKmh > 38) {
+      this.activeDriftTime += dt;
+      this.activeDriftPoints += physicsStep.driftPointsAwarded;
+    } else {
+      if (!this.activeDriftDamaged && this.activeDriftTime >= 1.1 && this.activeDriftPoints >= 150) {
+        this.ui.achievements.recordPerfectDrift(this.activeDriftPoints);
+        this.ui.showToast(`🔥 DRIFT PERFEITO! (+${Math.round(this.activeDriftPoints)} PTS)`);
+      }
+      this.resetDriftSession();
+    }
+
+    // Update Street & Sidewalk Pedestrians (NPCs)
+    const npcResult = this.npcs.update(
+      dt,
+      this.playerPhysics.position,
+      this.playerPhysics.speedKmh,
+      this.city.waypoints,
+      this.city.roadHalfWidth
+    );
+    if (npcResult.hitCount > 0) {
+      sound.playNpcBumpSound();
+      this.playerPhysics.driftScore = Math.max(0, this.playerPhysics.driftScore - 100 * npcResult.hitCount);
+      this.ui.showToast('⚠️ CUIDADO COM OS PEDESTRES! (-100 PTS)');
+      if (this.currentMode === 'free_roam' && this.police.heatLevel === 0) {
+        this.police.setHeat(1, this.playerPhysics.position, this.city.waypoints);
       }
     }
 
@@ -560,19 +726,23 @@ export class OutlawGameScene extends xb.Script {
       this.playerVehicleMeshGroup.rotation.z = this.playerPhysics.roll;
       this.playerVehicleMeshGroup.rotation.x = this.playerPhysics.pitch;
 
-      // Rotate Wheels
+      // Rotate Visible Wheels
       const wheelRollAngle = (this.playerPhysics.speedKmh / 3.6) * dt * 8;
       this.playerWheels.forEach((wheel, idx) => {
+        if (!wheel.visible) return;
         wheel.rotation.x += wheelRollAngle;
-        // Front wheels turn with steer angle
+        // Front wheels turn visually with steer angle (-X is right, +X is left)
         if (idx === 0 || idx === 1) {
-          wheel.rotation.y = this.playerPhysics.steerAngle;
+          wheel.rotation.y = -this.playerPhysics.steerAngle;
         }
       });
 
-      // Dynamic Lightweight Damage Deformation (100% health = factory fresh, 0% = crumpled)
-      const damageRatio = Math.max(0, Math.min(1.0, 1.0 - this.playerPhysics.health / 100));
-      this.playerDamageDeform?.(damageRatio);
+      // Dynamic Speed-Based Damage Effects (wind flutter, smoke, missing-wheel sparks)
+      this.playerUpdateDamageEffects?.(
+        dt,
+        this.playerPhysics.speedKmh,
+        this.playerPhysics.missingWheels
+      );
     }
 
     // 6. Camera Chase Logic with Exponential Damping (Zero allocations)
@@ -582,8 +752,8 @@ export class OutlawGameScene extends xb.Script {
 
     if (this.cameraMode === 'chase') {
       const speedDistanceStretch = Math.min(2.5, (this.playerPhysics.speedKmh / 250) * 2.5);
-      const camDist = 6.2 + speedDistanceStretch;
-      const camHeight = 2.4 + (this.playerPhysics.speedKmh / 250) * 0.8;
+      const camDist = (this.isVerticalMode ? 7.6 : 6.2) + speedDistanceStretch;
+      const camHeight = (this.isVerticalMode ? 2.85 : 2.4) + (this.playerPhysics.speedKmh / 250) * 0.8;
 
       OutlawGameScene._targetCamPos.set(
         this.playerPhysics.position.x - forwardX * camDist,
@@ -593,7 +763,7 @@ export class OutlawGameScene extends xb.Script {
 
       OutlawGameScene._targetLook.set(
         this.playerPhysics.position.x + forwardX * 4.0,
-        this.playerPhysics.position.y + 1.2,
+        this.playerPhysics.position.y + (this.isVerticalMode ? 1.35 : 1.2),
         this.playerPhysics.position.z + forwardZ * 4.0
       );
     } else {
@@ -616,19 +786,22 @@ export class OutlawGameScene extends xb.Script {
     this.cameraLookTarget.lerp(OutlawGameScene._targetLook, Math.min(1, dt * 12));
     this.camera.lookAt(this.cameraLookTarget);
 
-    // Dynamic FOV kick on high speeds / nitro
-    const targetFOV = 60 + (this.playerPhysics.speedKmh / 280) * 18 + (this.ui.controls.nitro ? 8 : 0);
+    // Dynamic FOV kick on high speeds / nitro (wider baseline in vertical mode)
+    const baseFov = this.isVerticalMode ? 69 : 60;
+    const targetFOV = baseFov + (this.playerPhysics.speedKmh / 280) * 18 + (this.ui.controls.nitro ? 8 : 0);
     this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFOV, 8, dt);
     this.camera.updateProjectionMatrix();
 
-    // 7. Update Audio Synthesizer
+    // 7. Update Audio Synthesizer & Dynamic City Ambiance Layer
+    const envAcoustics = this.city.getEnvironmentAcoustics(this.playerPhysics.position);
     sound.updateContinuousAudio(
       this.playerPhysics.speedKmh,
       this.playerPhysics.rpm,
       this.playerPhysics.driftSlip,
       this.ui.controls.nitro && this.playerPhysics.nitroReserve > 2,
       this.police.heatLevel,
-      pursuitResult.closestCopDist
+      pursuitResult.closestCopDist,
+      envAcoustics
     );
 
     // 8. Update HUD & Telemetry
@@ -675,6 +848,7 @@ export class OutlawGameScene extends xb.Script {
     }
 
     if (isEscaped) {
+      this.ui.achievements.recordEscape();
       if (this.currentMode === 'story' && this.currentStoryChapter) {
         // Unlock next story chapter!
         if (this.profile.storyChapter <= this.currentStoryChapter.id) {
@@ -721,6 +895,97 @@ export class OutlawGameScene extends xb.Script {
     return nearest || { position: new THREE.Vector3(0, 0, 0), heading: 0 };
   }
 
+  private worldDirToLocal(worldDir: THREE.Vector3, heading: number, out: THREE.Vector3) {
+    const sinH = Math.sin(heading);
+    const cosH = Math.cos(heading);
+    out.set(worldDir.x * cosH - worldDir.z * sinH, 0, worldDir.x * sinH + worldDir.z * cosH);
+    if (out.lengthSq() > 0.0001) out.normalize();
+  }
+
+  private maybeDetachWheel(
+    localHitDir: THREE.Vector3,
+    impactSpeedMs: number,
+    forceLoss: boolean = false
+  ) {
+    if (this.wheelLossCooldown > 0) return;
+
+    const missingCount = this.playerPhysics.missingWheels.filter(Boolean).length;
+    const isCornerOrSideHit = Math.abs(localHitDir.x) > 0.25;
+    const shouldDetach =
+      forceLoss ||
+      (impactSpeedMs >= 21 && isCornerOrSideHit) ||
+      impactSpeedMs >= 28 ||
+      (missingCount === 0 && this.playerPhysics.health < 62 && impactSpeedMs >= 13);
+
+    if (!shouldDetach) return;
+
+    const isFront = localHitDir.z >= -0.05;
+    const isPlusX = localHitDir.x >= 0;
+    const preferredIdx = (isFront ? 0 : 2) + (isPlusX ? 1 : 0);
+
+    const lostIdx = this.playerPhysics.triggerWheelLoss(preferredIdx);
+    if (lostIdx < 0) return;
+
+    this.wheelLossCooldown = 3.5;
+
+    // Spawn loose tumbling wheel flying off the struck corner
+    const sourceWheel = this.playerWheels[lostIdx];
+    if (sourceWheel) {
+      sourceWheel.getWorldPosition(OutlawGameScene._wheelWorldPos);
+      const looseWheel = sourceWheel.clone();
+      looseWheel.visible = true;
+      looseWheel.position.copy(OutlawGameScene._wheelWorldPos);
+      this.scene.add(looseWheel);
+
+      const sideSign = lostIdx === 1 || lostIdx === 3 ? 1 : -1;
+      const rightX = Math.cos(this.playerPhysics.heading);
+      const rightZ = -Math.sin(this.playerPhysics.heading);
+      const vel = new THREE.Vector3(
+        this.playerPhysics.velocity.x * 0.65 + rightX * sideSign * 6.5,
+        4.5 + Math.random() * 2.5,
+        this.playerPhysics.velocity.z * 0.65 + rightZ * sideSign * 6.5
+      );
+      this.detachedWheels.push({
+        mesh: looseWheel,
+        vel,
+        rotVel: new THREE.Vector3(10, (Math.random() - 0.5) * 8, sideSign * 5),
+        life: 3.5,
+      });
+    }
+
+    this.ui.showToast('⚠️ RODA ARRANCADA! O carro está puxando para o lado sem roda!');
+  }
+
+  private updateDetachedWheels(dt: number) {
+    for (let i = this.detachedWheels.length - 1; i >= 0; i--) {
+      const w = this.detachedWheels[i];
+      w.life -= dt;
+      if (w.life <= 0) {
+        this.scene.remove(w.mesh);
+        this.detachedWheels.splice(i, 1);
+        continue;
+      }
+      w.vel.y -= 20 * dt;
+      w.mesh.position.addScaledVector(w.vel, dt);
+      if (w.mesh.position.y < 0.36) {
+        w.mesh.position.y = 0.36;
+        w.vel.y = Math.abs(w.vel.y) * 0.48;
+        w.vel.x *= 0.86;
+        w.vel.z *= 0.86;
+      }
+      w.mesh.rotation.x += w.rotVel.x * dt;
+      w.mesh.rotation.y += w.rotVel.y * dt;
+      w.mesh.rotation.z += w.rotVel.z * dt;
+    }
+  }
+
+  private clearDetachedWheels() {
+    for (const w of this.detachedWheels) {
+      this.scene.remove(w.mesh);
+    }
+    this.detachedWheels = [];
+  }
+
   private calculateTrackProgress(pos: THREE.Vector3): number {
     if (this.city.waypoints.length === 0) return 0;
     let closestIdx = 0;
@@ -734,13 +999,19 @@ export class OutlawGameScene extends xb.Script {
     }
     return closestIdx / this.city.waypoints.length;
   }
+
+  dispose() {
+    sound.stopAll();
+    this.npcs?.dispose();
+    this.clearDetachedWheels();
+  }
 }
 
 // App Entry Point
 document.addEventListener('DOMContentLoaded', () => {
   const options = new xb.Options();
-  options.setAppTitle('Outlaw Velocity: Perseguição Policial 3D');
-  options.setAppDescription('Jogo 3D de corrida e perseguição policial com física realista, modo história com Luca & Miguel, carreira, multiplayer e giroscópio.');
+  options.setAppTitle('THE LINE OF DRIFT');
+  options.setAppDescription('O melhor jogo de Drift e perseguição que você vai ver!');
 
   xb.add(new OutlawGameScene());
   xb.init(options);

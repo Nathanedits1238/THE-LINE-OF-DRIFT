@@ -10,6 +10,7 @@ export type GameMode =
 export type GraphicsQuality = 'low' | 'medium' | 'high' | 'ultra';
 export type WeatherType = 'sunny' | 'rain' | 'storm' | 'fog';
 export type TimeOfDay = 'day' | 'sunset' | 'night' | 'midnight';
+export type OrientationMode = 'auto' | 'horizontal' | 'vertical';
 
 export interface VehicleConfig {
   id: string;
@@ -153,3 +154,38 @@ export interface PlayerControls {
   resetVehicle: boolean;
   switchCamera: boolean;
 }
+
+export type AchievementCategory = 'distance' | 'drift' | 'pursuit' | 'stunt' | 'garage';
+export type AchievementTier = 'bronze' | 'silver' | 'gold' | 'platinum';
+
+export interface AchievementStats {
+  totalDistanceKm: number;
+  perfectDriftsCount: number;
+  maxSingleDriftPoints: number;
+  totalDriftPoints: number;
+  copsDestroyed: number;
+  totalEscapes: number;
+  maxSpeedKmh: number;
+  stuntJumpsCount: number;
+  carsUnlocked: number;
+  upgradesInstalled: number;
+}
+
+export interface AchievementDefinition {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  category: AchievementCategory;
+  tier: AchievementTier;
+  statKey: keyof AchievementStats;
+  targetValue: number;
+  unit: string;
+  rewardCash: number;
+  rewardRep: number;
+  unlocked: boolean;
+  unlockedAt?: number;
+}
+
+export type NPCBehaviorMode = 'sidewalk_walk' | 'sidewalk_idle' | 'street_cross' | 'panic' | 'knocked';
+

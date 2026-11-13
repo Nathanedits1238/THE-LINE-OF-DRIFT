@@ -25,6 +25,8 @@ export class VehiclePhysics {
   public driftScore: number = 0;
   public nitroReserve: number = 100; // 0 to 100%
   public health: number = 100; // 0 to 100%
+  // Wheel integrity [Front-X, Front+X, Rear-X, Rear+X]
+  public missingWheels: [boolean, boolean, boolean, boolean] = [false, false, false, false];
 
   // Config parameters
   private maxSpeedMs: number = 65; // ~234 km/h
@@ -65,6 +67,32 @@ export class VehiclePhysics {
     this.isAirborne = false;
     this.targetGroundY = pos.y;
     this.health = 100;
+    this.missingWheels = [false, false, false, false];
+  }
+
+  /**
+   * Detaches a wheel at preferredIndex (0: Front-X, 1: Front+X, 2: Rear-X, 3: Rear+X).
+   * Capped at max 2 missing wheels so the vehicle always remains playable.
+   */
+  public triggerWheelLoss(preferredIndex?: number): number {
+    const missingCount = this.missingWheels.filter(Boolean).length;
+    if (missingCount >= 2) return -1;
+
+    if (
+      preferredIndex !== undefined &&
+      preferredIndex >= 0 &&
+      preferredIndex < 4 &&
+      !this.missingWheels[preferredIndex]
+    ) {
+      this.missingWheels[preferredIndex] = true;
+      return preferredIndex;
+    }
+
+    const intactIndices = [0, 1, 2, 3].filter((i) => !this.missingWheels[i]);
+    if (intactIndices.length === 0) return -1;
+    const chosen = intactIndices[Math.floor(Math.random() * intactIndices.length)];
+    this.missingWheels[chosen] = true;
+    return chosen;
   }
 
   public launchRamp(jumpSpeedY: number, launchPitch: number = 0.22) {
@@ -85,6 +113,35 @@ export class VehiclePhysics {
   } {
     dt = Math.min(dt, 0.05); // Frame clamp to avoid physics explosion
     this.targetGroundY = groundY;
+
+    // Missing wheel imbalance calculation (keeps car playable with ~2.8x counter-steer authority)
+    let missingCount = 0;
+    let wheelPullBias = 0; // negative pulls toward -X, positive pulls toward +X
+    let missingRollBias = 0; // positive dips -X down, negative dips +X down
+    if (this.missingWheels[0]) {
+      missingCount++;
+      wheelPullBias -= 1.0;
+      missingRollBias += 0.055;
+    }
+    if (this.missingWheels[1]) {
+      missingCount++;
+      wheelPullBias += 1.0;
+      missingRollBias -= 0.055;
+    }
+    if (this.missingWheels[2]) {
+      missingCount++;
+      wheelPullBias -= 0.75;
+      missingRollBias += 0.045;
+    }
+    if (this.missingWheels[3]) {
+      missingCount++;
+      wheelPullBias += 0.75;
+      missingRollBias -= 0.045;
+    }
+    wheelPullBias = THREE.MathUtils.clamp(wheelPullBias, -1.2, 1.2);
+
+    const effectiveMaxSpeedMs = this.maxSpeedMs * (1 - missingCount * 0.085);
+    const gripMultiplier = Math.max(0.68, 1 - missingCount * 0.14);
 
     // Forward and Right unit vectors in world space
     const forwardX = Math.sin(this.heading);
@@ -107,7 +164,7 @@ export class VehiclePhysics {
     }
 
     // Nitro consumption and recharge
-    let currentAccel = this.accelForce;
+    let currentAccel = this.accelForce * (1 - missingCount * 0.09);
     if (controls.nitro && this.nitroReserve > 2 && controls.throttle > 0) {
       this.nitroReserve = Math.max(0, this.nitroReserve - dt * 28);
       currentAccel *= 1.7;
@@ -120,7 +177,7 @@ export class VehiclePhysics {
     if (controls.throttle > 0) {
       if (forwardSpeed >= 0) {
         // Accelerate forward
-        const speedRatio = Math.max(0, 1 - forwardSpeed / this.maxSpeedMs);
+        const speedRatio = Math.max(0, 1 - forwardSpeed / effectiveMaxSpeedMs);
         longitudinalForce += controls.throttle * currentAccel * (0.35 + 0.65 * speedRatio);
       } else {
         // Braking while in reverse
@@ -139,10 +196,10 @@ export class VehiclePhysics {
       }
     }
 
-    // Aerodynamic Drag & Rolling Resistance
+    // Aerodynamic Drag & Rolling Resistance (hub scraping adds moderate drag)
     const speed = this.velocity.length();
     const drag = this.dragCoeff * speed * speed;
-    const rollingResistance = 0.8;
+    const rollingResistance = 0.8 + missingCount * 0.55;
     const resistanceForce = (drag + rollingResistance) * Math.sign(forwardSpeed);
 
     longitudinalForce -= resistanceForce;
@@ -150,19 +207,26 @@ export class VehiclePhysics {
     // Lateral grip and drift calculation
     const handbrakeActive = controls.handbrake;
     const isSlipping = Math.abs(lateralSpeed) > 2.5 || (handbrakeActive && speed > 5);
-    const currentGrip = handbrakeActive
-      ? this.gripDrift * 0.4
-      : isSlipping
-        ? this.gripDrift
-        : this.gripLateral;
+    const currentGrip =
+      (handbrakeActive
+        ? this.gripDrift * 0.4
+        : isSlipping
+          ? this.gripDrift
+          : this.gripLateral) * gripMultiplier;
 
     const lateralForce = -lateralSpeed * currentGrip;
 
-    // Turning dynamics (Ackermann-like steering)
+    // Turning dynamics (Ackermann-like steering + missing-wheel pull)
+    // Chase camera looks down +Z with +Y up, so screen right is -X (decreasing heading) and screen left is +X (increasing heading).
     const turnFactor = Math.min(1.0, Math.abs(forwardSpeed) / 4.0);
     const highSpeedStability = 1.0 / (1.0 + Math.max(0, speed - 25) * 0.02);
-    // Positive mapping: positive steer (+1, right) increases heading clockwise
-    let yawTorque = this.steerAngle * this.turnSpeed * turnFactor * highSpeedStability * Math.sign(forwardSpeed || 1);
+    let yawTorque =
+      -this.steerAngle * this.turnSpeed * turnFactor * highSpeedStability * Math.sign(forwardSpeed || 1);
+
+    // Pull smoothly toward the missing wheel's side while leaving ~2.8x counter-steer control
+    const pullSpeedFactor = Math.min(1.0, Math.abs(forwardSpeed) / 7.5);
+    const wheelPullTorque = wheelPullBias * 0.56 * pullSpeedFactor * Math.sign(forwardSpeed || 1);
+    yawTorque += wheelPullTorque;
 
     if (handbrakeActive && speed > 8) {
       // Induce kick-out oversteer
@@ -174,8 +238,8 @@ export class VehiclePhysics {
       this.isDrifting = false;
     }
 
-    if (Math.abs(controls.steer) < 0.01 && !this.isDrifting) {
-      // Strictly straight line lock: cancels unwanted micro-rotations when accelerating
+    if (Math.abs(controls.steer) < 0.01 && !this.isDrifting && Math.abs(wheelPullBias) < 0.01) {
+      // Strictly straight line lock when intact: cancels unwanted micro-rotations when accelerating
       this.angularVelocity = 0;
       yawTorque = 0;
     } else {
@@ -191,8 +255,13 @@ export class VehiclePhysics {
     this.velocity.x += (forwardX * totalForwardAcc + rightX * totalLateralAcc) * dt;
     this.velocity.z += (forwardZ * totalForwardAcc + rightZ * totalLateralAcc) * dt;
 
-    // Prevent lateral drift creep during straight-line acceleration
-    if (Math.abs(controls.steer) < 0.01 && !this.isDrifting && speed > 0.5) {
+    // Prevent lateral drift creep during straight-line acceleration when wheels are intact
+    if (
+      Math.abs(controls.steer) < 0.01 &&
+      !this.isDrifting &&
+      Math.abs(wheelPullBias) < 0.01 &&
+      speed > 0.5
+    ) {
       const forwardOnlyVel = this.velocity.x * forwardX + this.velocity.z * forwardZ;
       this.velocity.x = forwardX * forwardOnlyVel;
       this.velocity.z = forwardZ * forwardOnlyVel;
@@ -244,8 +313,8 @@ export class VehiclePhysics {
       dt
     );
 
-    // Visual Chassis Suspension Roll & Pitch
-    const targetRoll = -lateralSpeed * 0.025; // rolls away from turn
+    // Visual Chassis Suspension Roll & Pitch (includes subtle dip toward missing wheel side)
+    const targetRoll = -lateralSpeed * 0.025 + missingRollBias;
     const targetPitch = this.isAirborne ? this.pitch : totalForwardAcc * 0.015;
     this.roll = THREE.MathUtils.damp(this.roll, targetRoll, 8, dt);
     this.pitch = THREE.MathUtils.damp(this.pitch, targetPitch, 8, dt);
